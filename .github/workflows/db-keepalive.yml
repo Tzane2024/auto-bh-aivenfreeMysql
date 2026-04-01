@@ -1,0 +1,48 @@
+name: Database Keep-Alive Ping and Log
+
+on:
+  schedule:
+    - cron: '43 * * * *' # 保持你的原有时间
+  workflow_dispatch:
+
+jobs:
+  ping-and-log:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install MySQL Client
+        run: sudo apt-get update && sudo apt-get install -y mysql-client
+
+      - name: Check Table, Create if not exists, and Insert Log
+        env: # 通过环境变量安全地读取Secrets
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
+        run: |
+          # 使用 heredoc 方式执行一个完整的SQL脚本，避免密码出现在进程列表里
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+
+          -- 1. 检查名为 'bh' 的表是否存在，如果不存在则创建
+          CREATE TABLE IF NOT EXISTS bh (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+          -- 2. 向 bh 表中插入本次保活记录
+          INSERT INTO bh (ping_time) VALUES (NOW());
+
+          -- 3. (可选) 查询最近3次记录，仅用于日志输出确认
+          SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
+
+          EOF
+
+          # 检查MySQL命令是否成功执行
+          if [ $? -eq 0 ]; then
+            echo "✅ Success: The 'bh' table has been ensured and a ping log was inserted."
+          else
+            echo "❌ Error: The operation failed. Check the connection details and SQL syntax."
+            exit 1 # 失败时退出，标记步骤为红色
+          fi
+###########################
