@@ -63,7 +63,7 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 查询最近一次成功且已通知的记录
+          # 查询最近一次成功且已通知的记录ID
           LAST_SUCCESS_NOTIFIED=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
           SELECT id FROM bh 
           WHERE outcome = 'success' AND notified = TRUE 
@@ -71,10 +71,18 @@ jobs:
           EOF
           )
           
-          # 如果从未发送过成功通知，则发送
-          if [ -z "$LAST_SUCCESS_NOTIFIED" ]; then
+          # 查询最近一次成功的记录ID（不管是否通知）
+          LAST_SUCCESS=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT id FROM bh 
+          WHERE outcome = 'success' 
+          ORDER BY ping_time DESC LIMIT 1;
+          EOF
+          )
+          
+          # 如果最近一次成功记录就是已通知的记录，则不发送；否则发送
+          if [ -z "$LAST_SUCCESS_NOTIFIED" ] || [ "$LAST_SUCCESS" != "$LAST_SUCCESS_NOTIFIED" ]; then
             echo "should_notify=true" >> $GITHUB_OUTPUT
-            echo "首次成功运行（或失败后恢复），将发送成功通知"
+            echo "需要发送成功通知（首次成功或失败后恢复）"
           else
             echo "should_notify=false" >> $GITHUB_OUTPUT
             echo "已经发送过成功通知，本次不再重复发送"
@@ -135,7 +143,7 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 更新刚插入的成功记录，标记为不需要通知
+          # 更新刚插入的成功记录，标记为已通知（但不实际发送通知）
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           UPDATE bh 
           SET notified = TRUE 
