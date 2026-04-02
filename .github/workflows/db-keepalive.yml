@@ -1,4 +1,4 @@
-name: Database Keep-Alive-TG Ping and Log
+name: Database Keep-Alive-TG V1.0 Ping and Log
 
 on:
   schedule:
