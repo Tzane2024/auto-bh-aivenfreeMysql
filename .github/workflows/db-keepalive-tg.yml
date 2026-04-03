@@ -12,8 +12,9 @@ jobs:
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      # 1. 创建表（如果不存在）
+      # 1. 创建表（只在成功时才会执行完整，但失败时也会尝试）
       - name: Check and Create Tables
+        continue-on-error: true  # 即使失败也不影响后续
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -35,9 +36,10 @@ jobs:
           INSERT IGNORE INTO keepalive_state (id, last_status) VALUES (1, 'unknown');
           EOF
 
-      # 2. 获取上次运行状态
+      # 2. 获取上次运行状态（只用于判断是否发送成功通知，失败时此步骤可能失败但没关系）
       - name: Get Last Run Status
         id: get_status
+        continue-on-error: true
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -51,10 +53,10 @@ jobs:
           )
           echo "last_status=${LAST_STATUS:-unknown}" >> $GITHUB_OUTPUT
 
-      # 3. 执行数据库 keep-alive 操作（可能会失败）
+      # 3. 执行数据库 keep-alive 操作
       - name: Database Keep-Alive Operation
         id: database_operation
-        continue-on-error: true   # 允许失败，以便后续步骤仍能运行
+        continue-on-error: true
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -73,7 +75,7 @@ jobs:
             exit 1
           fi
 
-      # 4. 发送失败通知（只要上一步失败就发送）
+      # 4. 发送失败通知（无条件，只要数据库操作失败就发送）
       - name: Send Telegram Failure Notification
         if: steps.database_operation.outcome == 'failure'
         env:
@@ -84,8 +86,9 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
+          echo "失败通知已发送"
 
-      # 5. 判断是否需要发送成功通知（仅当状态从非 success 变为 success 时）
+      # 5. 判断是否需要发送成功通知
       - name: Determine If Success Notification Needed
         id: check_success
         if: steps.database_operation.outputs.current_outcome == 'success'
@@ -108,10 +111,11 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="${MESSAGE}"
+          echo "成功通知已发送"
 
-      # 7. 更新数据库中的状态（总是执行）
-      - name: Update Database State
-        if: always() && steps.database_operation.outputs.current_outcome != ''
+      # 7. 更新数据库状态（只在成功时更新，失败时不更新因为数据库不可写）
+      - name: Update Database State on Success
+        if: steps.database_operation.outputs.current_outcome == 'success'
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -119,7 +123,7 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
-          UPDATE keepalive_state SET last_status = '$CURRENT', updated_at = NOW() WHERE id = 1;
+          UPDATE keepalive_state SET last_status = 'success', updated_at = NOW() WHERE id = 1;
           EOF
+          echo "数据库状态已更新为 success"
