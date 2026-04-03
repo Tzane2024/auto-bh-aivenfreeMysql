@@ -12,7 +12,7 @@ jobs:
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      - name: Check and Create Table
+      - name: Check and Create Tables
         env:
           DB_HOST: ${{ secrets.AVN_DB_HOST }}
           DB_PORT: ${{ secrets.AVN_DB_PORT }}
@@ -21,26 +21,38 @@ jobs:
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          -- 日志表：记录每次 ping
           CREATE TABLE IF NOT EXISTS bh (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          
+          -- 状态表：记录最后一次运行状态
+          CREATE TABLE IF NOT EXISTS keepalive_state (
+            id INT PRIMARY KEY DEFAULT 1,
+            last_status VARCHAR(10) DEFAULT 'unknown',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+          
+          -- 初始化状态表（如果为空）
+          INSERT IGNORE INTO keepalive_state (id, last_status) VALUES (1, 'unknown');
           EOF
 
-      - name: Get Last Run Status from GitHub Variable
+      - name: Get Last Run Status
         id: get_status
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 获取上次运行状态变量
-          LAST_STATUS=$(gh variable list --repo $REPO --json name,value | jq -r '.[] | select(.name=="KEEPALIVE_LAST_STATUS") | .value' || echo "unknown")
-          
-          # 如果没有设置过变量，默认为 unknown（首次运行）
-          if [ -z "$LAST_STATUS" ]; then
-            LAST_STATUS="unknown"
-          fi
+          # 查询上次运行状态
+          LAST_STATUS=$(mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -sN <<EOF
+          SELECT last_status FROM keepalive_state WHERE id = 1;
+          EOF
+          )
           
           echo "last_status=$LAST_STATUS" >> $GITHUB_OUTPUT
           echo "上次运行状态: $LAST_STATUS"
@@ -116,18 +128,22 @@ jobs:
             -d text="${MESSAGE}"
           echo "成功通知已发送"
 
-      - name: Update GitHub Variable with Current Status
-        if: always()
+      - name: Update Database State with Current Status
+        if: always() && steps.database_operation.outputs.current_outcome != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          DB_HOST: ${{ secrets.AVN_DB_HOST }}
+          DB_PORT: ${{ secrets.AVN_DB_PORT }}
+          DB_USER: ${{ secrets.AVN_DB_USER }}
+          DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
           CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
           
-          if [ -n "$CURRENT" ]; then
-            # 设置 GitHub 变量
-            gh variable set KEEPALIVE_LAST_STATUS --body "$CURRENT" --repo $REPO
-            echo "已更新 KEEPALIVE_LAST_STATUS = $CURRENT"
-          else
-            echo "无法获取当前状态，跳过变量更新"
-          fi
+          # 更新状态表
+          mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
+          UPDATE keepalive_state 
+          SET last_status = '$CURRENT', updated_at = NOW()
+          WHERE id = 1;
+          EOF
+          
+          echo "已更新数据库状态: last_status = $CURRENT"
