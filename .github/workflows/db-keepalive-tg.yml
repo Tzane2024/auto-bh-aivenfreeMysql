@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，避免冲突
 
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
@@ -139,12 +141,37 @@ jobs:
             fi
           fi
 
-      # 提交并推送状态文件
+      # 提交并推送状态文件（解决冲突版）
       - name: Commit and Push Status File
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 配置 git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 获取当前分支名
+          if [ -n "${{ github.head_ref }}" ]; then
+            BRANCH_NAME=${{ github.head_ref }}
+          else
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          fi
+          
+          echo "当前分支: $BRANCH_NAME"
+          
+          # 拉取最新的远程更改（使用 rebase 避免合并提交）
+          git pull origin $BRANCH_NAME --rebase --autostash || true
+          
+          # 添加状态文件
           git add status.txt
-          git diff --staged --quiet || git commit -m "Update keepalive status"
-          git push
+          
+          # 检查是否有变更需要提交
+          if git diff --staged --quiet; then
+            echo "状态文件无变化，无需提交"
+          else
+            git commit -m "Update keepalive status [skip ci]"
+            # 推送更改，使用 token 进行认证
+            git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git $BRANCH_NAME
+            echo "状态文件已推送"
+          fi
