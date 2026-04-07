@@ -12,7 +12,8 @@ jobs:
       - name: Install MySQL Client
         run: sudo apt-get update && sudo apt-get install -y mysql-client
 
-      - name: Restore Last Notified Status from Cache
+      # 恢复上次通知状态
+      - name: Restore Last Notified Status
         id: cache_restore
         uses: actions/cache/restore@v3
         with:
@@ -20,18 +21,20 @@ jobs:
             status.txt
           key: keepalive-status
 
+      # 读取状态
       - name: Read Last Notified Status
         id: read_status
         run: |
           if [ -f status.txt ]; then
-            LAST_STATUS=$(cat status.txt)
-            echo "last_notified_status=$LAST_STATUS" >> $GITHUB_OUTPUT
-            echo "上次已通知的状态: $LAST_STATUS"
+            LAST=$(cat status.txt)
+            echo "last_status=$LAST" >> $GITHUB_OUTPUT
+            echo "上次通知状态: $LAST"
           else
-            echo "last_notified_status=unknown" >> $GITHUB_OUTPUT
+            echo "last_status=unknown" >> $GITHUB_OUTPUT
             echo "首次运行，上次状态: unknown"
           fi
 
+      # 数据库操作（失败时不中断）
       - name: Database Keep-Alive Operation
         id: database_operation
         continue-on-error: true
@@ -42,34 +45,29 @@ jobs:
           DB_PASS: ${{ secrets.AVN_DB_PASSWORD }}
           DB_NAME: ${{ secrets.AVN_DB_NAME }}
         run: |
-          # 创建表（如果不存在）
           mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           CREATE TABLE IF NOT EXISTS bh (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             remark VARCHAR(255) DEFAULT 'GitHub Actions Keep-Alive'
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-          EOF
           
-          # 执行数据库插入
-          if mysql --ssl-mode=REQUIRED -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" -D "$DB_NAME" <<EOF
           INSERT INTO bh (ping_time) VALUES (NOW());
           SELECT * FROM bh ORDER BY ping_time DESC LIMIT 3;
           EOF
-          then
-            echo "current_outcome=success" >> $GITHUB_OUTPUT
-            echo "✅ Success: Database operation completed."
-          else
-            echo "current_outcome=failure" >> $GITHUB_OUTPUT
-            echo "❌ Error: Database operation failed."
-            exit 1
-          fi
 
+      # 判断是否发送通知
       - name: Determine If Should Send Notification
         id: should_send
         run: |
-          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
-          LAST="${{ steps.read_status.outputs.last_notified_status }}"
+          # 获取数据库操作结果（通过步骤 outcome，而不是输出）
+          if [ "${{ steps.database_operation.outcome }}" = "success" ]; then
+            CURRENT="success"
+          else
+            CURRENT="failure"
+          fi
+          
+          LAST="${{ steps.read_status.outputs.last_status }}"
           
           echo "当前状态: $CURRENT"
           echo "上次通知状态: $LAST"
@@ -77,18 +75,21 @@ jobs:
           # 失败：总是发送
           if [ "$CURRENT" = "failure" ]; then
             echo "should_send=true" >> $GITHUB_OUTPUT
-            echo "失败，需要发送通知"
+            echo "message_type=failure" >> $GITHUB_OUTPUT
+            echo "需要发送失败通知"
           # 成功：只在状态变化时发送（unknown->success 或 failure->success）
           elif [ "$CURRENT" = "success" ] && [ "$LAST" != "success" ]; then
             echo "should_send=true" >> $GITHUB_OUTPUT
-            echo "成功且状态变化（$LAST -> success），需要发送通知"
+            echo "message_type=success" >> $GITHUB_OUTPUT
+            echo "需要发送成功通知（从失败恢复）"
           else
             echo "should_send=false" >> $GITHUB_OUTPUT
-            echo "成功但状态未变化，不发送通知"
+            echo "连续成功，不发送通知"
           fi
 
+      # 发送失败通知
       - name: Send Telegram Failure Notification
-        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'failure'
+        if: steps.should_send.outputs.should_send == 'true' && steps.should_send.outputs.message_type == 'failure'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -99,8 +100,9 @@ jobs:
             -d text="${MESSAGE}"
           echo "失败通知已发送"
 
+      # 发送成功通知（仅恢复时）
       - name: Send Telegram Success Notification
-        if: steps.should_send.outputs.should_send == 'true' && steps.database_operation.outputs.current_outcome == 'success'
+        if: steps.should_send.outputs.should_send == 'true' && steps.should_send.outputs.message_type == 'success'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -111,25 +113,38 @@ jobs:
             -d text="${MESSAGE}"
           echo "成功通知已发送"
 
-      - name: Save Current Status to Cache
-        id: save_cache
+      # 保存状态到缓存
+      - name: Save Status to Cache
         if: always()
         run: |
-          CURRENT="${{ steps.database_operation.outputs.current_outcome }}"
+          # 获取当前状态
+          if [ "${{ steps.database_operation.outcome }}" = "success" ]; then
+            CURRENT="success"
+          else
+            CURRENT="failure"
+          fi
+          
           SHOULD_SEND="${{ steps.should_send.outputs.should_send }}"
+          LAST="${{ steps.read_status.outputs.last_status }}"
           
           # 确定要保存的状态
           if [ "$SHOULD_SEND" = "true" ]; then
-            # 如果发送了通知，保存当前状态
+            # 发送了通知，保存当前状态
             echo "$CURRENT" > status.txt
+            echo "保存状态: $CURRENT (已通知)"
           else
-            # 如果没有发送通知，保持上次状态不变
-            LAST="${{ steps.read_status.outputs.last_notified_status }}"
-            echo "$LAST" > status.txt
+            # 没发送通知，保持原状态不变
+            if [ -z "$LAST" ] || [ "$LAST" = "unknown" ]; then
+              # 首次运行且成功但没发通知（理论上不会发生）
+              echo "$CURRENT" > status.txt
+              echo "保存状态: $CURRENT"
+            else
+              echo "$LAST" > status.txt
+              echo "保存状态: $LAST (不变)"
+            fi
           fi
-          
-          echo "保存状态到缓存: $(cat status.txt)"
 
+      # 保存缓存
       - name: Save Cache
         uses: actions/cache/save@v3
         if: always()
